@@ -1,0 +1,160 @@
+#!/bin/bash
+
+# Arguments
+if [[ -z "$1" || -z "$2" ]]; then
+  echo "Usage: i3status_custom <drive> <nic>"
+  echo "   eg. i3status_custom /dev/sdc3 enp4s0"
+  exit 2
+fi
+arg_drive=$1
+arg_nic=$2
+
+# Config
+interval=5 # seconds between runs, must match value in ~.i3status
+netdown_max=800 # highest possible net speed, will be assigned color_bad when scaling
+netup_max=100
+clr_good="#000000"
+clr_bad="#FFFFFF"
+clr_ok="#888888"
+
+
+#####################################################################################
+
+# Functions
+function json {
+  echo "{ \"full_text\": \"$1\", \"color\": \"$2\" },"
+}
+
+function clr_scale {
+  color_fade.sh $clr_good $clr_bad "$1"
+}
+
+function clr_scale_inv {
+  clr_scale "$(echo "1 - $1" | bc)"
+}
+
+function netdown_total {
+  cat "/sys/class/net/$arg_nic/statistics/rx_bytes"
+}
+
+function netup_total {
+  cat "/sys/class/net/$arg_nic/statistics/tx_bytes"
+}
+
+function netrate_to_KBs {
+  echo "$1 / $interval / 1024" | bc
+}
+
+function round {
+  printf "%.0f" "$1"
+}
+
+function floor {
+  if [[ $(echo "if ($1 >= 1) 1" | bc) ]]; then
+    echo "${1/.*}"
+  else
+    echo '0'
+  fi
+}
+
+# Some fields are only relevant on portable machines
+command -v iw > /dev/null
+report_on_wifi=$?
+test -d /sys/class/power_supply/BAT0
+report_on_bat=$?
+
+# Source for network and CPU data records only running totals.
+# Keep track of existing totals so that the next iteration can find data specific to it
+netdown_prevtotal=$(netdown_total)
+netup_prevtotal=$(netup_total)
+read _ user nice system idle_prevtotal iowait irq softirq _ < /proc/stat
+cpu_prevtotal=$((user+nice+system+iowait+irq+softirq))
+
+
+i3status | while :
+do
+  read i3status_line
+
+  report_str=""
+
+  read _ user nice system idle_total iowait irq softirq _ < /proc/stat
+  cpu_total=$((user+nice+system+iowait+irq+softirq))
+  cpu_cur=$((cpu_total - cpu_prevtotal))
+  idle_cur=$((idle_total - idle_prevtotal))
+  cpu_frac=$(echo "$cpu_cur / ($cpu_cur + $idle_cur)" | bc -l)
+  cpu_perc=$(echo "$cpu_frac * 100" | bc)
+  cpu_prevtotal=$cpu_total
+  idle_prevtotal=$idle_total
+  report_str+=$(json "CPU: $(round "$cpu_perc")%" "$(clr_scale "$cpu_frac")")
+
+  if [[ "$(dropbox status)" == "Dropbox isn't running!" ]] ; then
+    dropbox="Down"
+    dropbox_clr=$clr_bad
+  else
+    if [[ "$(dropbox status)" == "Up to date" ]]; then
+      dropbox="Up"
+      dropbox_clr=$clr_good
+    else
+      dropbox=$(dropbox status | grep -E '(Uploading|Downloading)' | sort | tr -d '"' \
+        | tr '\n' ' ' | sed 's/\.\.\.//g' | sed 's/Uploading/↑/g' | sed 's/Downloading/↓/g' \
+        | sed 's/ left//g' | sed 's/ files//g' | sed -r 's/[0-9]*.[0-9] KB\/sec, //g')
+      dropbox="${dropbox%?}"
+      dropbox_clr=$clr_ok
+    fi
+  fi
+  report_str+=$(json "DB: $dropbox" "$dropbox_clr")
+
+  ram_data=$(free -m | grep 'buffers/cache')
+  ram_frac=$(echo "$ram_data" | awk '{printf "%f", $3/($3+$4)}')
+  ram_output=$(echo "$ram_data" | awk '{printf "%.1f/%.0fGB", $3/1000, ($3+$4)/1000}')  
+  report_str+=$(json "RAM: $ram_output" "$(clr_scale "$ram_frac")")
+
+  drive_data=$(df "$arg_drive" | tail -n1)
+  drive_frac=$(echo "$drive_data" | awk '{printf "%f", $3/$2}')
+  drive_output=$(echo "$drive_data" | awk '{printf "%.1f/%.0fGB", $3/1024/1024, $2/1024/1024}')
+  report_str+=$(json "SSD: $drive_output" "$(clr_scale "$drive_frac")")
+
+  netdown_cur=$(netrate_to_KBs $(( $(netdown_total) - netdown_prevtotal )))
+  netup_cur=$(netrate_to_KBs $(( $(netup_total) - netup_prevtotal )))
+  netdown_clr=$(clr_scale "$(echo "$netdown_cur / $netdown_max" | bc -l)")
+  netup_clr=$(clr_scale "$(echo "$netup_cur / $netup_max" | bc -l)")
+  netdown_prevtotal=$(netdown_total)
+  netup_prevtotal=$(netup_total)
+  report_str+=$(json "↓${netdown_cur}KB/s" "$netdown_clr")
+  report_str+=$(json "↑${netup_cur}KB/s" "$netup_clr")
+
+  if [[ "$report_on_bat" -eq 0 ]]; then
+    bat_charge=$(cat /sys/class/power_supply/BAT0/charge_now)
+    bat_capacity=$(cat /sys/class/power_supply/BAT0/charge_full_design)
+    bat_rate=$(cat /sys/class/power_supply/BAT0/current_now)
+    bat_frac=$(echo "$bat_charge / $bat_capacity" | bc -l)
+    bat_perc=$(round "$(echo "$bat_frac * 100" | bc)")
+    if [[ $(cat /sys/class/power_supply/BAT0/status) == "Charging" ]]; then
+      bat_time_hours=$(echo "($bat_capacity - $bat_charge) / $bat_rate" | bc -l)  
+      bat_status="CHR:"
+    else
+      bat_time_hours=$(echo "$bat_charge / $bat_rate" | bc -l)
+      bat_status="BAT:"
+    fi
+    bat_time_mins=$(echo "($bat_time_hours - $(floor "$bat_time_hours")) * 60" | bc -l)
+    printf -v bat_str "$bat_status %d%% %d:%02d" \
+      "$bat_perc" "$(floor "$bat_time_hours")" "$(round "$bat_time_mins")"
+    report_str+=$(json "$bat_str" "$(clr_scale_inv "$bat_frac")")
+  fi
+
+  if [[ "$report_on_wifi" -eq 0 ]]; then
+    if [[ "$(iw dev "$arg_nic" link)" == 'Not connected.' ]]; then
+      report_str+=$(json "Wi-Fi: Down" "$clr_bad")
+    else
+      wifi_ssid=$(iw dev "$arg_nic" link | grep SSID | cut -d ' ' -f2)
+      wifi_frac=$(iwconfig "$arg_nic" | grep Quality | cut -d '=' -f2 | cut -d ' ' -f1 | bc -l)
+      wifi_perc=$(round "$(echo "$wifi_frac * 100" | bc)")
+      printf -v wifi_str "Wi-Fi: %.0f%% @ $wifi_ssid" "$wifi_perc"
+      report_str+=$(json "$wifi_str" "$(clr_scale_inv "$wifi_frac")")
+    fi
+  fi
+
+  report_str+=$(json "$(ip addr show "$arg_nic" | grep "inet " | cut -d ' ' -f6)" $clr_ok)
+
+  echo "${i3status_line/[/[ $report_str}" || exit 3
+done
