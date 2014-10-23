@@ -77,16 +77,6 @@ do
 
   report_str=""
 
-  read _ user nice system idle_total iowait irq softirq _ < /proc/stat
-  cpu_total=$((user+nice+system+iowait+irq+softirq))
-  cpu_cur=$((cpu_total - cpu_prevtotal))
-  idle_cur=$((idle_total - idle_prevtotal))
-  cpu_frac=$(echo "$cpu_cur / ($cpu_cur + $idle_cur)" | bc -l)
-  cpu_perc=$(echo "$cpu_frac * 100" | bc)
-  cpu_prevtotal=$cpu_total
-  idle_prevtotal=$idle_total
-  report_str+=$(json "CPU: $(round "$cpu_perc")%" "$(clr_scale "$cpu_frac")")
-
   if [[ "$(dropbox status)" == "Dropbox isn't running!" ]] ; then
     dropbox="Down"
     dropbox_clr=$clr_bad
@@ -103,6 +93,16 @@ do
     fi
   fi
   report_str+=$(json "DB: $dropbox" "$dropbox_clr")
+
+  read _ user nice system idle_total iowait irq softirq _ < /proc/stat
+  cpu_total=$((user+nice+system+iowait+irq+softirq))
+  cpu_cur=$((cpu_total - cpu_prevtotal))
+  idle_cur=$((idle_total - idle_prevtotal))
+  cpu_frac=$(echo "$cpu_cur / ($cpu_cur + $idle_cur)" | bc -l)
+  cpu_perc=$(echo "$cpu_frac * 100" | bc)
+  cpu_prevtotal=$cpu_total
+  idle_prevtotal=$idle_total
+  report_str+=$(json "CPU: $(round "$cpu_perc")%" "$(clr_scale "$cpu_frac")")
 
   ram_data=$(free -m | grep 'buffers/cache')
   ram_frac=$(echo "$ram_data" | awk '{printf "%f", $3/($3+$4)}')
